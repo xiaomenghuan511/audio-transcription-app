@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import tempfile
 from datetime import datetime
-from audio_utils import AudioPreprocessor, AudioTrimmer
+from audio_utils import AudioPreprocessor, AudioTrimmer, AudioSegmenter
 from transcription import AudioAnalyzer
 from pydub import AudioSegment
 import time
@@ -31,6 +31,17 @@ if 'trimmed_files' not in st.session_state:
     st.session_state.trimmed_files = {}
 if 'processing_results' not in st.session_state:
     st.session_state.processing_results = {}
+if 'segmented_files' not in st.session_state:
+    st.session_state.segmented_files = {}
+if 'segmentation_params' not in st.session_state:
+    st.session_state.segmentation_params = {
+        'min_length': 30,
+        'max_length': 60
+    }
+if 'segmentation_completed' not in st.session_state:
+    st.session_state.segmentation_completed = False
+if 'total_processing_time' not in st.session_state:
+    st.session_state.total_processing_time = 0
 
 def save_uploaded_file(uploaded_file):
     """Save uploaded file to temporary directory and return path"""
@@ -79,7 +90,7 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("Settings")
+        st.header("Audio Settings")
         
         # Date input
         recording_date = st.date_input(
@@ -95,7 +106,7 @@ def main():
         )
         
         # Silence detection settings
-        st.subheader("Silence Detection Settings")
+        st.subheader("✂️ Silence Detection Settings")
         min_silence_len = st.slider(
             "Minimum Silence Length (seconds)",
             min_value=0.5,
@@ -112,6 +123,29 @@ def main():
             step=1,
             help="Sound levels below this threshold are considered silence"
         )
+        
+        # Audio segmentation settings
+        st.subheader("🔄 Audio Segmentation Settings")
+        min_segment_length = st.slider(
+            "Minimum Segment Length (seconds)",
+            min_value=20,
+            max_value=45,
+            value=st.session_state.segmentation_params['min_length'],
+            step=5,
+            help="Minimum length of each audio segment"
+        )
+        max_segment_length = st.slider(
+            "Maximum Segment Length (seconds)",
+            min_value=45,
+            max_value=90,
+            value=st.session_state.segmentation_params['max_length'],
+            step=5,
+            help="Maximum length of each audio segment"
+        )
+        
+        # Update segmentation parameters in session state
+        st.session_state.segmentation_params['min_length'] = min_segment_length
+        st.session_state.segmentation_params['max_length'] = max_segment_length
         
         # Multiple file uploader
         uploaded_files = st.file_uploader(
@@ -173,7 +207,7 @@ def main():
         )
 
         # Add tabs for different processing steps
-        tabs = st.tabs(["Silence Detection", "Full Processing"])
+        tabs = st.tabs(["Silence Detection", "Audio Segmentation", "Full Processing"])
         
         # Silence Detection Tab
         with tabs[0]:
@@ -294,8 +328,140 @@ def main():
                         
                         st.divider()
 
-        # Full Processing Tab
+        # Audio Segmentation Tab
         with tabs[1]:
+            st.subheader("🔄 Audio Segmentation")
+            
+            # Check if there are trimmed files available
+            available_files = [
+                file_name for file_name, info in st.session_state.trimmed_files.items()
+                if os.path.exists(info['path'])
+            ]
+            
+            if not available_files:
+                st.warning("Please process some files in the Silence Detection tab first.")
+            else:
+                # File selection for segmentation
+                files_to_segment = st.multiselect(
+                    "Select trimmed files to segment",
+                    available_files,
+                    default=available_files
+                )
+                
+                # Display previous results if available
+                if st.session_state.segmentation_completed:
+                    st.success(f"Segmentation completed for {len(st.session_state.segmented_files)} files!")
+                    st.info(f"Total processing time: {format_time(st.session_state.total_processing_time)}")
+                    
+                    # Display results for all processed files
+                    for file_name, seg_info in st.session_state.segmented_files.items():
+                        with st.expander(f"Results for: {file_name}", expanded=True):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Total Segments", str(seg_info['segment_count']))
+                            with col2:
+                                avg_duration = sum(seg['duration'] for seg in seg_info['segments']) / len(seg_info['segments'])
+                                st.metric("Average Segment Duration", f"{avg_duration:.1f}s")
+                            with col3:
+                                st.metric("Original Duration", f"{st.session_state.trimmed_files[file_name]['duration']:.1f}s")
+                            
+                            # Display segments table
+                            segments_df = pd.DataFrame([
+                                {
+                                    'Segment': f"Segment {i+1}",
+                                    'Start Time': f"{int(seg['start']//60):02d}:{int(seg['start']%60):02d}",
+                                    'End Time': f"{int(seg['end']//60):02d}:{int(seg['end']%60):02d}",
+                                    'Duration': f"{seg['duration']:.1f}s"
+                                }
+                                for i, seg in enumerate(seg_info['segments'])
+                            ])
+                            st.dataframe(segments_df, use_container_width=True, hide_index=True)
+                            
+                            # Download button for zip file
+                            if os.path.exists(seg_info['zip_path']):
+                                with open(seg_info['zip_path'], 'rb') as f:
+                                    st.download_button(
+                                        label=f"📥 Download Segments for {file_name}",
+                                        data=f,
+                                        file_name=os.path.basename(seg_info['zip_path']),
+                                        mime="application/zip"
+                                    )
+                
+                # Process button
+                if st.button("🔄 Segment Selected Files", type="primary"):
+                    if not files_to_segment:
+                        st.warning("Please select at least one file to segment.")
+                        st.stop()
+                    
+                    # Create progress container
+                    progress_container = st.empty()
+                    total_start_time = time.time()
+                    
+                    for idx, file_name in enumerate(files_to_segment):
+                        file_info = st.session_state.trimmed_files[file_name]
+                        
+                        # Update progress
+                        with progress_container.container():
+                            st.subheader(f"Processing: {file_name} ({idx + 1}/{len(files_to_segment)})")
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            segments_list = st.empty()
+                        
+                        # Initialize segmenter with parameters from sidebar
+                        start_time = time.time()
+                        segmenter = AudioSegmenter(
+                            file_info['path'],
+                            min_segment_length=st.session_state.segmentation_params['min_length'],
+                            max_segment_length=st.session_state.segmentation_params['max_length']
+                        )
+                        
+                        # Update progress - 20%
+                        progress_bar.progress(0.2)
+                        status_text.text("Analyzing audio boundaries...")
+                        
+                        # Segment audio
+                        segments = segmenter.segment_audio()
+                        
+                        # Update progress - 60%
+                        progress_bar.progress(0.6)
+                        status_text.text("Preparing segments...")
+                        
+                        # Create temporary directory for segments
+                        with tempfile.TemporaryDirectory() as temp_dir:
+                            # Export segments
+                            base_filename = os.path.splitext(file_name)[0]
+                            segment_files = segmenter.export_segments(temp_dir, base_filename)
+                            
+                            # Update progress - 80%
+                            progress_bar.progress(0.8)
+                            status_text.text("Creating zip archive...")
+                            
+                            # Create zip file
+                            zip_filename = f"{base_filename}_segments.zip"
+                            zip_path = os.path.join(os.path.dirname(file_info['path']), zip_filename)
+                            segmenter.create_zip_archive(segment_files, zip_path)
+                            
+                            # Store segmentation info
+                            st.session_state.segmented_files[file_name] = {
+                                'segments': segments,
+                                'zip_path': zip_path,
+                                'segment_count': len(segments)
+                            }
+                            
+                            # Update progress - 100%
+                            progress_bar.progress(1.0)
+                            status_text.text("Segmentation complete!")
+                    
+                    # Store total processing time and mark as completed
+                    st.session_state.total_processing_time = time.time() - total_start_time
+                    st.session_state.segmentation_completed = True
+                    
+                    # Clear progress container and rerun to show results
+                    progress_container.empty()
+                    st.experimental_rerun()
+
+        # Full Processing Tab
+        with tabs[2]:
             if st.button("🎯 Process Selected Audio Files", type="primary"):
                 if not st.session_state.selected_files:
                     st.warning("Please select at least one file to process.")
@@ -403,6 +569,12 @@ def main():
                 except:
                     pass
             
+            for segmented_info in st.session_state.segmented_files.values():
+                try:
+                    os.remove(segmented_info['zip_path'])
+                except:
+                    pass
+            
             # Reset session state
             st.session_state.processed_files = []
             st.session_state.current_results = []
@@ -411,6 +583,13 @@ def main():
             st.session_state.selected_files = []
             st.session_state.trimmed_files = {}
             st.session_state.processing_results = {}
+            st.session_state.segmented_files = {}
+            st.session_state.segmentation_params = {
+                'min_length': 30,
+                'max_length': 60
+            }
+            st.session_state.segmentation_completed = False
+            st.session_state.total_processing_time = 0
             st.experimental_rerun()
     else:
         st.info("Please upload audio files in the sidebar to begin.")
