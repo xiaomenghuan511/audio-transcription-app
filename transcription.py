@@ -1,77 +1,71 @@
 import os
-import torch
 import whisper
 import numpy as np
-from pyannote.audio import Pipeline
-from speechbrain.pretrained import EncoderClassifier
-import tensorflow as tf
-import tensorflow_hub as hub
 from typing import Dict, List, Tuple
 import tempfile
+import librosa
+from pyannote.audio import Pipeline
+import torch
 
 class AudioAnalyzer:
     def __init__(self, hf_token: str):
-        # Initialize models
-        self.whisper_model = whisper.load_model("base")
-        self.diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization",
-            use_auth_token=hf_token
-        )
-        self.emotion_model = EncoderClassifier.from_hparams(
-            source="speechbrain/emotion-recognition-wav2vec2-large"
-        )
-        # Load YAMNet for ambient sound classification
-        self.yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
-        
-        self.emotion_labels = ['neutral', 'happy', 'sad', 'angry', 'fearful', 'disgusted', 'surprised']
+        """Initialize the audio analyzer with necessary models."""
+        try:
+            self.whisper_model = whisper.load_model("base")
+        except Exception as e:
+            raise Exception(f"Failed to load Whisper model: {str(e)}")
+            
+        # Initialize diarization pipeline
+        try:
+            self.diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization",
+                use_auth_token=hf_token
+            )
+        except Exception as e:
+            print(f"Error initializing diarization pipeline: {str(e)}")
+            print("\nPlease make sure you have:")
+            print("1. A valid HuggingFace token")
+            print("2. Accepted the user agreement at: https://huggingface.co/pyannote/speaker-diarization")
+            print("3. Accepted the user agreement at: https://huggingface.co/pyannote/segmentation")
+            raise Exception("Failed to initialize diarization pipeline")
 
     def transcribe_audio(self, audio_path: str) -> Dict:
         """Transcribe audio using Whisper."""
-        result = self.whisper_model.transcribe(audio_path)
-        return result
+        try:
+            result = self.whisper_model.transcribe(audio_path)
+            return result
+        except Exception as e:
+            print(f"Error in transcription: {str(e)}")
+            return {"text": "Transcription failed", "error": str(e)}
+
+    def detect_speech_activity(self, audio_path: str) -> bool:
+        """Simple speech activity detection using energy threshold."""
+        try:
+            y, sr = librosa.load(audio_path)
+            energy = librosa.feature.rms(y=y)
+            return np.mean(energy) > 0.01
+        except Exception as e:
+            print(f"Error in speech detection: {str(e)}")
+            return True
 
     def perform_diarization(self, audio_path: str) -> List[Dict]:
-        """Perform speaker diarization."""
-        diarization = self.diarization_pipeline(audio_path)
-        
-        speaker_segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segment = {
-                'start': turn.start,
-                'end': turn.end,
-                'speaker': speaker
-            }
-            speaker_segments.append(segment)
-        
-        return speaker_segments
-
-    def detect_emotion(self, audio_path: str) -> str:
-        """Detect emotion in speech segment."""
-        waveform = self.emotion_model.load_audio(
-            audio_path,
-            savedir=tempfile.gettempdir()
-        )
-        batch = waveform.unsqueeze(0)
-        predictions = self.emotion_model.classify_batch(batch)
-        emotion_idx = predictions[0].argmax().item()
-        return self.emotion_labels[emotion_idx]
-
-    def classify_ambient_sound(self, audio_path: str) -> List[str]:
-        """Classify ambient sounds using YAMNet."""
-        waveform, sample_rate = tf.audio.decode_wav(
-            tf.io.read_file(audio_path),
-            desired_channels=1
-        )
-        waveform = tf.squeeze(waveform, axis=-1)
-        
-        scores, embeddings, spectrogram = self.yamnet_model(waveform)
-        class_scores = tf.reduce_mean(scores, axis=0)
-        top_classes = tf.argsort(class_scores, direction='DESCENDING')[:3]
-        
-        # Get class names from YAMNet
-        class_names = self.yamnet_model.class_names
-        ambient_sounds = [class_names[i].numpy().decode('utf-8') for i in top_classes]
-        return ambient_sounds
+        """Perform speaker diarization using pyannote.audio."""
+        try:
+            diarization = self.diarization_pipeline(audio_path)
+            
+            speaker_segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segment = {
+                    'start': turn.start,
+                    'end': turn.end,
+                    'speaker': speaker
+                }
+                speaker_segments.append(segment)
+            
+            return speaker_segments
+        except Exception as e:
+            print(f"Error in diarization: {str(e)}")
+            return [{'start': 0, 'end': 0, 'speaker': 'Unknown'}]
 
     def process_chunk(self, chunk_info: Dict, temp_dir: str) -> Dict:
         """Process a single audio chunk."""
@@ -84,25 +78,47 @@ class AudioAnalyzer:
             'duration': chunk_info['duration']
         }
         
-        if chunk_info['has_speech']:
-            # Transcribe
-            transcription = self.transcribe_audio(temp_path)
-            result['transcript'] = transcription['text']
-            
-            # Diarize
-            speakers = self.perform_diarization(temp_path)
-            result['speakers'] = speakers
-            
-            # Detect emotion
-            emotion = self.detect_emotion(temp_path)
-            result['emotion'] = emotion
-        else:
-            # Classify ambient sounds
-            ambient_sounds = self.classify_ambient_sound(temp_path)
-            result['ambient_sounds'] = ambient_sounds
+        has_speech = self.detect_speech_activity(temp_path)
         
-        # Clean up
-        os.remove(temp_path)
+        if has_speech:
+            # Perform diarization first
+            speakers = self.perform_diarization(temp_path)
+            result['speakers'] = []
+            
+            # For each speaker segment, extract audio and transcribe
+            for speaker_segment in speakers:
+                start_ms = int(speaker_segment['start'] * 1000)
+                end_ms = int(speaker_segment['end'] * 1000)
+                
+                # Extract segment audio
+                segment_audio = chunk_info['audio_data'][start_ms:end_ms]
+                segment_path = os.path.join(temp_dir, f"temp_segment_{start_ms}.wav")
+                segment_audio.export(segment_path, format='wav')
+                
+                # Transcribe segment
+                transcription = self.transcribe_audio(segment_path)
+                
+                # Add to result
+                result['speakers'].append({
+                    'start': speaker_segment['start'],
+                    'end': speaker_segment['end'],
+                    'speaker': speaker_segment['speaker'],
+                    'transcript': transcription['text']
+                })
+                
+                # Clean up segment file
+                try:
+                    os.remove(segment_path)
+                except:
+                    pass
+        else:
+            result['ambient_sounds'] = ['background noise']
+        
+        # Clean up chunk file
+        try:
+            os.remove(temp_path)
+        except:
+            pass
         return result
 
     def format_timestamp(self, seconds: float) -> str:
@@ -117,17 +133,20 @@ class AudioAnalyzer:
         output_lines = []
         
         for result in results:
-            timestamp = self.format_timestamp(result['start_time'])
-            output_lines.append(f"\n[{timestamp}]")
-            
-            if 'transcript' in result:
-                speaker_info = result['speakers'][0] if result['speakers'] else {'speaker': 'Unknown'}
-                output_lines.append(
-                    f"[{speaker_info['speaker']}], [{result['emotion']}]: {result['transcript']}"
-                )
-            else:
+            if 'speakers' in result and result['speakers']:
+                for speaker_info in result['speakers']:
+                    # Calculate absolute timestamp
+                    abs_start = result['start_time'] + speaker_info['start']
+                    timestamp = self.format_timestamp(abs_start)
+                    
+                    if speaker_info['transcript'].strip():  # Only add non-empty transcripts
+                        output_lines.append(
+                            f"[{timestamp}] [{speaker_info['speaker']}]: {speaker_info['transcript']}"
+                        )
+            elif 'ambient_sounds' in result:
+                timestamp = self.format_timestamp(result['start_time'])
                 sounds = ', '.join(result['ambient_sounds'])
-                output_lines.append(f"[Ambient Sound - {sounds}]")
+                output_lines.append(f"[{timestamp}] [Ambient Sound - {sounds}]")
         
         return '\n'.join(output_lines)
 

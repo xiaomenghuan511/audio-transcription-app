@@ -4,6 +4,10 @@ from pydub import AudioSegment
 import librosa
 import soundfile as sf
 from typing import List, Tuple, Dict
+from pydub.silence import detect_nonsilent
+import matplotlib.pyplot as plt
+import io
+import base64
 
 class AudioPreprocessor:
     def __init__(self):
@@ -90,4 +94,103 @@ class AudioPreprocessor:
 
     def save_chunk(self, chunk: AudioSegment, output_path: str):
         """Save an audio chunk to file."""
-        chunk.export(output_path, format='wav') 
+        chunk.export(output_path, format='wav')
+
+class AudioTrimmer:
+    def __init__(self, audio_path):
+        self.audio = AudioSegment.from_file(audio_path)
+        self.original_duration = len(self.audio) / 1000.0  # seconds
+        self.silence_ranges = []
+        self.non_silence_ranges = []
+        self.trimmed_duration = 0
+        
+    def detect_silence(self, min_silence_len=1000, silence_thresh=-40):
+        """
+        Detect silence in audio file
+        min_silence_len: minimum length of silence in ms
+        silence_thresh: silence threshold in dB
+        """
+        # Convert to ms
+        audio_len = len(self.audio)
+        
+        # Detect non-silent ranges
+        non_silent_ranges = detect_nonsilent(
+            self.audio,
+            min_silence_len=min_silence_len,
+            silence_thresh=silence_thresh
+        )
+        
+        # Convert ranges to seconds
+        self.non_silence_ranges = [(start/1000, end/1000) for start, end in non_silent_ranges]
+        
+        # Calculate silence ranges
+        self.silence_ranges = []
+        current_pos = 0
+        
+        for start, end in self.non_silence_ranges:
+            if start * 1000 > current_pos:
+                self.silence_ranges.append((current_pos/1000, start))
+            current_pos = end * 1000
+            
+        if current_pos < audio_len:
+            self.silence_ranges.append((current_pos/1000, audio_len/1000))
+            
+        # Calculate trimmed duration
+        self.trimmed_duration = sum(end - start for start, end in self.non_silence_ranges)
+        
+        return {
+            'original_duration': self.original_duration,
+            'trimmed_duration': self.trimmed_duration,
+            'trim_ratio': (self.original_duration - self.trimmed_duration) / self.original_duration * 100
+        }
+    
+    def create_timeline_visualization(self):
+        """
+        Create a visualization of silence vs non-silence segments
+        Returns: base64 encoded PNG image
+        """
+        fig, ax = plt.subplots(figsize=(15, 2))
+        
+        # Plot silence ranges in gray
+        for start, end in self.silence_ranges:
+            ax.axvspan(start, end, color='gray', alpha=0.3)
+            
+        # Plot non-silence ranges in blue
+        for start, end in self.non_silence_ranges:
+            ax.axvspan(start, end, color='blue', alpha=0.3)
+            
+        # Set axis limits
+        ax.set_xlim(0, self.original_duration)
+        
+        # Remove y-axis
+        ax.set_yticks([])
+        
+        # Add timeline markers
+        ax.set_xticks(np.arange(0, self.original_duration + 60, 60))
+        ax.set_xticklabels([f"{int(x/60):02d}:{int(x%60):02d}" for x in np.arange(0, self.original_duration + 60, 60)])
+        
+        # Add labels
+        ax.set_xlabel("Timeline (MM:SS)")
+        ax.set_title("Audio Timeline (Gray: Silence, Blue: Active Audio)")
+        
+        # Save plot to bytes buffer
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.close()
+        
+        # Encode to base64
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode('utf-8')
+        
+    def get_trimmed_audio(self):
+        """
+        Return a new AudioSegment with only non-silent parts
+        """
+        if not self.non_silence_ranges:
+            return self.audio
+            
+        trimmed_audio = AudioSegment.empty()
+        for start, end in self.non_silence_ranges:
+            trimmed_audio += self.audio[int(start * 1000):int(end * 1000)]
+            
+        return trimmed_audio 

@@ -21,26 +21,38 @@ wheels/
 *.egg
 
 # Virtual Environment
-venv/
+.env
+.venv
 env/
+venv/
 ENV/
+env.bak/
+venv.bak/
+.conda/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.DS_Store
 
 # Project specific
 *.wav
 *.mp3
-*.ogg
 *.m4a
-*_transcript.txt
-.env
+*.ogg
+temp/
+processed/
+*.log
+.streamlit/secrets.toml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
 
 # Misc
-.DS_Store
 .env
 .env.local
 .env.development.local

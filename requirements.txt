@@ -1,14 +1,38 @@
-streamlit>=1.28.0
-openai-whisper>=20231117
-pydub>=0.25.1
-torch>=2.0.0
-torchaudio>=2.0.0
-pyannote.audio>=3.1.1
-transformers>=4.35.0
-speechbrain>=0.5.15
-tensorflow>=2.14.0  # for YAMNet
-tensorflow-hub>=0.14.0
-numpy>=1.24.0
-scipy>=1.10.0
-librosa>=0.10.1
-soundfile>=0.12.1 
+# 修正后的requirements.txt - 稳定版本锁定
+# 解决你当前配置的兼容性问题
+
+# Web界面
+streamlit==1.28.1
+
+# 核心PyTorch生态 - 降级到稳定版本
+torch==2.0.1
+torchaudio==2.0.2
+
+# Whisper - 使用稳定版本而非最新
+openai-whisper==20230314
+
+# Transformers生态 - 锁定兼容版本
+transformers==4.30.2
+
+# 音频处理 - 锁定稳定版本
+librosa==0.9.2
+soundfile==0.10.3.post1
+pydub==0.25.1
+
+# 科学计算基础 - 兼容版本
+numpy==1.24.3
+pandas==2.0.2
+
+# 支持库
+scipy==1.10.1
+tqdm==4.65.0
+requests==2.31.0
+typing-extensions==4.6.3
+
+# HuggingFace
+huggingface-hub==0.15.1
+tokenizers==0.13.3
+safetensors==0.3.1
+
+# 新增的包
+packaging==23.2

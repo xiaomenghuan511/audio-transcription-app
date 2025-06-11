@@ -1,80 +1,130 @@
-# Audio Transcription Web App
+# 🎙️ Nirva Audio Lab
 
-This application provides a comprehensive audio transcription service with speaker diarization, emotion detection, and ambient sound classification.
+Nirva Audio Lab is a powerful audio processing application that provides comprehensive audio analysis and transcription capabilities. Built with Python and Streamlit, it offers an intuitive interface for processing audio files with advanced features.
 
-## Features
-- Audio file upload and processing
-- Automatic transcription using Whisper
-- Speaker diarization with pyannote.audio
-- Emotion detection using SpeechBrain
-- Ambient sound classification using YAMNet
-- Timestamped output with speaker and emotion labels
-- Background sound detection for non-speech segments
+## ✨ Features
 
-## Requirements
-- Python 3.8 or higher
-- HuggingFace account and access token
-- Sufficient disk space for audio processing
-- GPU recommended for faster processing (but not required)
+- **✂️ Silence Detection and Trimming**
+  - Automatically detect and remove silence segments
+  - Visual timeline representation of audio content
+  - Adjustable silence threshold and minimum length
+  - Download trimmed audio files
 
-## Installation
+- **🔄 Audio Segmentation**
+  - Split audio into meaningful segments
+  - Intelligent boundary detection
+  - Preserve context between segments
 
-1. Clone the repository:
+- **🗣️ Advanced Transcription**
+  - Speaker identification and diarization
+  - High-accuracy speech-to-text conversion
+  - Support for multiple audio formats (WAV, MP3, M4A)
+
+- **😊 Emotion Detection**
+  - Analyze speaker emotions
+  - Identify emotional patterns and changes
+  - Emotional context annotation
+
+- **🎵 Ambient Sound Classification**
+  - Detect and classify background sounds
+  - Environmental context analysis
+  - Noise type identification
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Python 3.10 or higher
+- Conda package manager
+
+### Installation
+
+1. Create and activate a conda environment:
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-cd YOUR_REPO_NAME
+conda create -n nirva python=3.10
+conda activate nirva
 ```
 
-2. Install dependencies:
+2. Install required packages in the following order:
 ```bash
-pip install -r requirements.txt
+# Basic scientific packages
+conda install numpy scipy pandas
+
+# PyTorch and torchaudio
+conda install pytorch==1.13.1 torchaudio==0.13.1 -c pytorch
+
+# Audio processing libraries
+conda install -c conda-forge librosa soundfile
+pip install pydub
+
+# Transformers and dependencies
+pip install transformers
+
+# Whisper
+pip install openai-whisper
+
+# Streamlit
+pip install streamlit
+
+# Pyannote audio
+pip install pyannote.audio==2.1.1
 ```
 
-3. Get your HuggingFace token:
-- Go to https://huggingface.co/settings/tokens
-- Create a new token with read access
-- Save it for use in the application
+### Usage
 
-## Usage
-
-1. Run the application:
+1. Start the application:
 ```bash
 streamlit run app.py
 ```
 
-2. In the web interface:
-- Enter your HuggingFace token in the sidebar
-- Set the recording date
-- Upload one or more audio files
-- Wait for processing to complete
-- Save the transcript using the "Save Transcript" button
+2. Access the web interface at `http://localhost:8501`
 
-## Output Format
+3. Upload audio files and process them using the available features:
+   - Select files to process
+   - Adjust silence detection parameters if needed
+   - Choose between silence trimming and full processing
+   - Download processed results
 
-The application generates timestamped transcripts with the following format:
+## 🛠️ Technical Details
 
-```
-[00:00:12]
-[Speaker A], [confident]: Hello, this is a test...
+- **Frontend**: Streamlit
+- **Audio Processing**: PyTorch, torchaudio, librosa
+- **Speech Recognition**: Whisper
+- **Speaker Diarization**: pyannote.audio
+- **Visualization**: Matplotlib, Streamlit components
 
-[00:00:18]
-[Ambient Sound - background music]
-```
+## 📊 Processing Pipeline
 
-## Supported Audio Formats
-- WAV
-- MP3
-- OGG
-- M4A
+1. **File Upload**
+   - Support for multiple file uploads
+   - Automatic format detection
+   - Initial audio analysis
 
-## Notes
-- Supports multiple audio files processing
-- Automatically handles file format conversion
-- Detects and filters out repetitive or nonsensical content
-- Saves transcripts with date-based filenames
+2. **Silence Processing**
+   - Configurable silence detection
+   - Visual timeline generation
+   - Non-destructive trimming
 
-## License
-MIT License
+3. **Audio Analysis**
+   - Speaker diarization
+   - Transcription
+   - Emotion and ambient sound analysis
 
-## Contributing
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change. 
+4. **Results Presentation**
+   - Interactive visualizations
+   - Downloadable processed files
+   - Detailed analytics
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 📝 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 🙏 Acknowledgments
+
+- OpenAI Whisper for speech recognition
+- Pyannote.audio for speaker diarization
+- Streamlit for the web interface 
