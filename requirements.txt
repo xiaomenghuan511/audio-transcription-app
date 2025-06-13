@@ -5,8 +5,8 @@
 streamlit==1.28.1
 
 # 核心PyTorch生态 - 降级到稳定版本
-torch==2.0.1
-torchaudio==2.0.2
+torch==1.13.1
+torchaudio==0.13.1
 
 # Whisper - 使用稳定版本而非最新
 openai-whisper==20230314
@@ -36,3 +36,12 @@ safetensors==0.3.1
 
 # 新增的包
 packaging==23.2
+
+# 新增的包
+pyannote.audio==2.1.1
+
+# 新增的包
+matplotlib
+
+# 新增的包
+openai

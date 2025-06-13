@@ -3,11 +3,16 @@ import os
 import tempfile
 from datetime import datetime
 from audio_utils import AudioPreprocessor, AudioTrimmer, AudioSegmenter
-from transcription import AudioAnalyzer
+from transcription import (
+    OptimizedMultiModelTranscriber, OptimizedSpeakerDiarizer, 
+    WhisperCloudModel, WhisperLocalModel, DeepgramModel
+)
 from pydub import AudioSegment
 import time
 import pandas as pd
 import io
+import asyncio
+import requests
 
 # Set page config
 st.set_page_config(
@@ -42,6 +47,27 @@ if 'segmentation_completed' not in st.session_state:
     st.session_state.segmentation_completed = False
 if 'total_processing_time' not in st.session_state:
     st.session_state.total_processing_time = 0
+if 'transcription_results' not in st.session_state:
+    st.session_state.transcription_results = {}
+if 'transcription_completed' not in st.session_state:
+    st.session_state.transcription_completed = False
+# Add new session state variables for API keys and model selections
+if 'openai_api_key' not in st.session_state:
+    st.session_state.openai_api_key = ""
+if 'huggingface_token' not in st.session_state:
+    st.session_state.huggingface_token = ""
+if 'deepgram_api_key' not in st.session_state:
+    st.session_state.deepgram_api_key = ""
+if 'whisper_cloud_enabled' not in st.session_state:
+    st.session_state.whisper_cloud_enabled = False
+if 'whisper_local_enabled' not in st.session_state:
+    st.session_state.whisper_local_enabled = False
+if 'deepgram_enabled' not in st.session_state:
+    st.session_state.deepgram_enabled = False
+if 'whisper_cloud_sizes' not in st.session_state:
+    st.session_state.whisper_cloud_sizes = ["base"]
+if 'whisper_local_sizes' not in st.session_state:
+    st.session_state.whisper_local_sizes = ["base"]
 
 def save_uploaded_file(uploaded_file):
     """Save uploaded file to temporary directory and return path"""
@@ -77,6 +103,90 @@ def format_time(seconds):
     remaining_seconds = seconds % 60
     return f"{minutes} minutes {remaining_seconds:.1f} seconds"
 
+def validate_openai_api(api_key: str) -> bool:
+    """Validate OpenAI API key"""
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        # Test with a simple API call
+        response = requests.get(
+            "https://api.openai.com/v1/models",
+            headers=headers,
+            timeout=10
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+def validate_deepgram_api(api_key: str) -> bool:
+    """Validate Deepgram API key"""
+    try:
+        headers = {
+            "Authorization": f"Token {api_key}",
+            "Content-Type": "application/json"
+        }
+        # Test with a simple API call
+        response = requests.get(
+            "https://api.deepgram.com/v1/projects",
+            headers=headers,
+            timeout=10
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+async def transcribe_with_realtime_updates(transcriber, segment_paths, original_audio_path,
+                                         progress_bar, status_text, realtime_areas, log_area):
+    """Custom transcription method with real-time updates"""
+    # Perform diarization only if enabled
+    full_diarization = None
+    if transcriber.diarizer:
+        log_area.text("Performing speaker diarization on full audio...")
+        full_diarization = transcriber.diarizer.diarize_full_audio(original_audio_path)
+        log_area.text("Speaker diarization completed")
+    
+    # Initialize results storage
+    results = {model.model_name: [] for model in transcriber.models}
+    accumulated_transcripts = {model.model_name: "" for model in transcriber.models}
+    
+    # Process segments one by one for real-time display
+    total_segments = len(segment_paths)
+    for i, segment_info in enumerate(segment_paths):
+        # Update progress
+        progress = 0.3 + (0.6 * (i + 1) / total_segments)
+        progress_bar.progress(progress)
+        status_text.text(f"Processing segment {i+1}/{total_segments}...")
+        
+        # Log segment processing
+        log_area.text(f"Processing segment {i+1}/{total_segments} from {segment_info['path']}")
+        
+        # Transcribe this segment with all models
+        segment_results = await transcriber.transcribe_segment_batch(segment_info, full_diarization)
+        
+        # Update results and real-time display
+        for model_name, result in segment_results.items():
+            results[model_name].append(result)
+            
+            # Update accumulated transcript
+            if 'formatted_output' in result:
+                accumulated_transcripts[model_name] += result['formatted_output'] + "\n"
+                log_area.text(f"Updated transcript for {model_name} - Segment {i+1}")
+            
+            # Update real-time display
+            if model_name in realtime_areas:
+                realtime_areas[model_name].text_area(
+                    f"Progress: {i+1}/{total_segments}",
+                    accumulated_transcripts[model_name],
+                    height=300,
+                    key=f"realtime_{model_name}_{i}"
+                )
+        
+        log_area.text(f"Completed processing segment {i+1}/{total_segments}")
+    
+    return results
+
 def main():
     st.title("🎙️ Nirva Audio Lab")
     st.markdown("""
@@ -98,12 +208,101 @@ def main():
             datetime.now().date()
         )
         
-        # HuggingFace token input
-        hf_token = st.text_input(
+        # Multiple file uploader - moved to top
+        uploaded_files = st.file_uploader(
+            "Choose audio files",
+            type=['wav', 'mp3', 'm4a'],
+            accept_multiple_files=True
+        )
+        
+        # API Keys
+        st.subheader("🔑 API Keys")
+        
+        # Initialize validation variables
+        openai_api_valid = False
+        deepgram_api_valid = False
+        
+        # OpenAI API Key
+        openai_api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            value=st.session_state.openai_api_key,
+            help="Required for Whisper Cloud API"
+        )
+        if openai_api_key:
+            st.session_state.openai_api_key = openai_api_key
+            if st.button("🔍 Validate OpenAI API", key="validate_openai"):
+                with st.spinner("Validating OpenAI API..."):
+                    openai_api_valid = validate_openai_api(openai_api_key)
+                    if openai_api_valid:
+                        st.success("✅ OpenAI API key is valid!")
+                    else:
+                        st.error("❌ OpenAI API key is invalid or unreachable!")
+        
+        # HuggingFace Token
+        huggingface_token = st.text_input(
             "HuggingFace Token",
             type="password",
-            help="Get your token from https://huggingface.co/settings/tokens"
+            value=st.session_state.huggingface_token,
+            help="Required for downloading Whisper models and speaker diarization"
         )
+        if huggingface_token:
+            st.session_state.huggingface_token = huggingface_token
+            if st.button("🔍 Validate HuggingFace Token", key="validate_huggingface"):
+                with st.spinner("Validating HuggingFace token..."):
+                    try:
+                        # First check if token is valid by checking user info
+                        headers = {"Authorization": f"Bearer {huggingface_token}"}
+                        
+                        # Try to access the model directly
+                        model_response = requests.get(
+                            "https://huggingface.co/pyannote/speaker-diarization",
+                            headers=headers,
+                            timeout=5
+                        )
+                        
+                        if model_response.status_code == 200:
+                            st.success("✅ HuggingFace token is valid and has access to the diarization model!")
+                        elif model_response.status_code == 403:
+                            st.warning("⚠️ Please accept the user conditions at https://huggingface.co/pyannote/speaker-diarization")
+                        else:
+                            # Try to access the API as a fallback
+                            api_response = requests.get(
+                                "https://huggingface.co/api/whoami",
+                                headers=headers,
+                                timeout=5
+                            )
+                            
+                            if api_response.status_code == 200:
+                                st.success("✅ HuggingFace token is valid!")
+                            else:
+                                st.error(f"❌ Token validation failed. Status code: {api_response.status_code}")
+                                st.error("Please make sure you have:")
+                                st.error("1. Created a token with 'read' access")
+                                st.error("2. Accepted the user agreement")
+                                st.error("3. Accepted the model terms at https://huggingface.co/pyannote/speaker-diarization")
+                        
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"❌ Network error: {str(e)}")
+                    except Exception as e:
+                        st.error(f"❌ Error validating token: {str(e)}")
+        
+        # Deepgram API Key
+        deepgram_api_key = st.text_input(
+            "Deepgram API Key",
+            type="password",
+            value=st.session_state.deepgram_api_key,
+            help="Required for Deepgram API"
+        )
+        if deepgram_api_key:
+            st.session_state.deepgram_api_key = deepgram_api_key
+            if st.button("🔍 Validate Deepgram API", key="validate_deepgram"):
+                with st.spinner("Validating Deepgram API..."):
+                    deepgram_api_valid = validate_deepgram_api(deepgram_api_key)
+                    if deepgram_api_valid:
+                        st.success("✅ Deepgram API key is valid!")
+                    else:
+                        st.error("❌ Deepgram API key is invalid or unreachable!")
         
         # Silence detection settings
         st.subheader("✂️ Silence Detection Settings")
@@ -147,15 +346,65 @@ def main():
         st.session_state.segmentation_params['min_length'] = min_segment_length
         st.session_state.segmentation_params['max_length'] = max_segment_length
         
-        # Multiple file uploader
-        uploaded_files = st.file_uploader(
-            "Choose audio files",
-            type=['wav', 'mp3', 'm4a'],
-            accept_multiple_files=True
+        # Model Selection
+        st.subheader("🎯 Select Transcription Models")
+        
+        # Whisper Cloud (single checkbox)
+        whisper_cloud_enabled = st.checkbox("Whisper Cloud (OpenAI's hosted model)", value=True)
+        
+        # Whisper Local (with size selection)
+        whisper_local_enabled = st.checkbox("Whisper Local")
+        if whisper_local_enabled:
+            whisper_local_models = ["tiny", "base", "small", "medium"]
+            selected_local_model = st.selectbox(
+                "Select Whisper Local Model Size",
+                whisper_local_models,
+                index=1  # Default to "base"
+            )
+        
+        # WhisperX (with size selection)
+        whisperx_enabled = st.checkbox("WhisperX")
+        if whisperx_enabled:
+            whisperx_models = ["tiny", "base", "small", "medium", "large"]
+            selected_whisperx_model = st.selectbox(
+                "Select WhisperX Model Size",
+                whisperx_models,
+                index=1  # Default to "base"
+            )
+        
+        # Collect selected models
+        selected_models = []
+        if whisper_cloud_enabled:
+            selected_models.append("Whisper Cloud")
+        if whisper_local_enabled:
+            selected_models.append("Whisper Local")
+        if whisperx_enabled:
+            selected_models.append("WhisperX")
+        
+        if not selected_models:
+            st.error("Please select at least one model")
+            st.stop()
+        
+        # Transcription settings
+        st.subheader("🗣️ Transcription with Speaker Diarization")
+        
+        # Diarization toggle
+        enable_diarization = st.checkbox(
+            "Enable Speaker Diarization",
+            value=True,
+            help="Enable speaker diarization to identify different speakers in the audio"
         )
+        
+        # Initialize diarizer if enabled
+        diarizer = None
+        if enable_diarization:
+            if not huggingface_token:
+                st.error("HuggingFace token is required for speaker diarization")
+                st.stop()
+            diarizer = OptimizedSpeakerDiarizer(huggingface_token)
 
     # Main content area
-    if not hf_token:
+    if not huggingface_token:
         st.warning("Please enter your HuggingFace token in the sidebar to continue.")
         st.stop()
 
@@ -207,7 +456,7 @@ def main():
         )
 
         # Add tabs for different processing steps
-        tabs = st.tabs(["Silence Detection", "Audio Segmentation", "Full Processing"])
+        tabs = st.tabs(["Silence Detection", "Audio Segmentation", "Transcription & Diarization", "Full Processing"])
         
         # Silence Detection Tab
         with tabs[0]:
@@ -458,10 +707,279 @@ def main():
                     
                     # Clear progress container and rerun to show results
                     progress_container.empty()
-                    st.experimental_rerun()
+                    st.rerun()
+
+        # Transcription & Diarization Tab
+        with tabs[2]:
+            st.subheader("🗣️ Transcription with Speaker Diarization")
+            
+            # Check if there are segmented files available
+            available_segmented_files = [
+                file_name for file_name, info in st.session_state.segmented_files.items()
+                if os.path.exists(info['zip_path'])
+            ]
+            
+            if not available_segmented_files:
+                st.warning("Please process some files in the Audio Segmentation tab first.")
+            else:
+                # Validate model selection
+                selected_models = []
+                if whisper_cloud_enabled:
+                    selected_models.append("Whisper Cloud")
+                
+                if whisper_local_enabled:
+                    selected_models.append("Whisper Local")
+                
+                if whisperx_enabled:
+                    selected_models.append("WhisperX")
+                
+                if len(selected_models) > 3:
+                    st.error("Please select at most 3 transcription models in total.")
+                    st.stop()
+                elif len(selected_models) == 0:
+                    st.warning("Please select at least one transcription model in the sidebar.")
+                    st.stop()
+                
+                # Display selected models
+                st.info(f"Selected models: {', '.join(selected_models)}")
+                
+                # File selection for transcription
+                files_to_transcribe = st.multiselect(
+                    "Select segmented files to transcribe",
+                    available_segmented_files,
+                    default=available_segmented_files[:1]
+                )
+                
+                # Display previous results if available
+                if st.session_state.transcription_completed and st.session_state.transcription_results:
+                    st.success("Transcription completed!")
+                    
+                    for file_name, model_results in st.session_state.transcription_results.items():
+                        st.subheader(f"Results for: {file_name}")
+                        
+                        # Create columns for each model
+                        if len(model_results) == 1:
+                            cols = [st.container()]
+                        elif len(model_results) == 2:
+                            cols = st.columns(2)
+                        else:
+                            cols = st.columns(3)
+                        
+                        for i, (model_name, transcript) in enumerate(model_results.items()):
+                            with cols[i]:
+                                st.write(f"**{model_name}**")
+                                st.text_area(
+                                    f"Transcript ({model_name})",
+                                    transcript,
+                                    height=400,
+                                    key=f"transcript_{file_name}_{model_name}"
+                                )
+                                
+                                # Download button
+                                st.download_button(
+                                    label=f"📥 Download {model_name}",
+                                    data=transcript,
+                                    file_name=f"{os.path.splitext(file_name)[0]}_{model_name}_transcript.txt",
+                                    mime="text/plain"
+                                )
+                
+                # Process button
+                if st.button("🗣️ Transcribe Selected Files", type="primary"):
+                    if not files_to_transcribe:
+                        st.warning("Please select at least one file to transcribe.")
+                        st.stop()
+                    
+                    # Create containers for real-time display
+                    progress_container = st.empty()
+                    realtime_container = st.empty()
+                    
+                    # Initialize selected models
+                    models = []
+                    st.write("Initializing models...")
+                    if "Whisper Cloud" in selected_models:
+                        st.write("Initializing Whisper Cloud model...")
+                        try:
+                            if not openai_api_key:
+                                st.error("OpenAI API key is required for Whisper Cloud")
+                                st.stop()
+                            model = WhisperCloudModel("whisper-1", openai_api_key)
+                            st.write("Successfully initialized Whisper Cloud model")
+                            models.append(model)
+                        except Exception as e:
+                            st.error(f"Error initializing Whisper Cloud model: {str(e)}")
+                            st.stop()
+                    
+                    if "Whisper Local" in selected_models:
+                        st.write("Initializing Whisper Local model...")
+                        try:
+                            if not selected_local_model:
+                                st.error("Please select a local model size")
+                                st.stop()
+                            model = WhisperLocalModel(selected_local_model)
+                            st.write(f"Successfully initialized Whisper Local {selected_local_model} model")
+                            models.append(model)
+                        except Exception as e:
+                            st.error(f"Error initializing Whisper Local model: {str(e)}")
+                            st.stop()
+                    
+                    if "WhisperX" in selected_models:
+                        st.write("Initializing WhisperX model...")
+                        try:
+                            if not selected_whisperx_model:
+                                st.error("Please select a WhisperX model size")
+                                st.stop()
+                            model = WhisperXModel(selected_whisperx_model)
+                            st.write(f"Successfully initialized WhisperX {selected_whisperx_model} model")
+                            models.append(model)
+                        except Exception as e:
+                            st.error(f"Error initializing WhisperX model: {str(e)}")
+                            st.stop()
+                    
+                    if not models:
+                        st.error("No models were initialized. Please select at least one model.")
+                        st.stop()
+                    
+                    # Initialize diarizer only if enabled
+                    diarizer = None
+                    if enable_diarization:
+                        if not huggingface_token:
+                            st.error("HuggingFace token is required for speaker diarization")
+                            st.stop()
+                        diarizer = OptimizedSpeakerDiarizer(huggingface_token)
+                    
+                    # Create transcriber
+                    st.write("Initializing transcriber...")
+                    try:
+                        transcriber = OptimizedMultiModelTranscriber(models, diarizer)
+                        st.write("Successfully initialized transcriber")
+                    except Exception as e:
+                        st.error(f"Error initializing transcriber: {str(e)}")
+                        st.stop()
+                    
+                    # Process each file
+                    for file_name in files_to_transcribe:
+                        st.write(f"Starting processing for {file_name}...")
+                        try:
+                            with progress_container.container():
+                                st.subheader(f"Transcribing: {file_name}")
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                
+                                # Create a log container that will persist
+                                log_container = st.container()
+                                with log_container:
+                                    st.subheader("📋 Processing Log")
+                                    log_area = st.empty()
+                                    log_area.text("Initializing transcription process...")
+                                
+                                # Real-time results display
+                                with realtime_container.container():
+                                    st.subheader("📝 Real-time Transcription Results")
+                                    
+                                    # Create columns for real-time display
+                                    if len(models) == 1:
+                                        realtime_cols = [st.container()]
+                                    elif len(models) == 2:
+                                        realtime_cols = st.columns(2)
+                                    else:
+                                        realtime_cols = st.columns(3)
+                                    
+                                    # Initialize real-time display areas
+                                    realtime_areas = {}
+                                    for i, model in enumerate(models):
+                                        with realtime_cols[i]:
+                                            st.write(f"**{model.model_name}**")
+                                            realtime_areas[model.model_name] = st.empty()
+                                
+                                # Get segments and original audio path
+                                log_area.text("Loading audio segments...")
+                                segments_info = st.session_state.segmented_files[file_name]['segments']
+                                original_audio_path = st.session_state.trimmed_files[file_name]['path']
+                                log_area.text(f"Found {len(segments_info)} segments to process")
+                                
+                                # Prepare segment info for transcription
+                                log_area.text("Preparing segments for transcription...")
+                                segment_paths = []
+                                for i, segment in enumerate(segments_info):
+                                    temp_path = os.path.join(
+                                        tempfile.gettempdir(),
+                                        f"segment_{file_name}_{i}.wav"
+                                    )
+                                    segment['audio'].export(temp_path, format='wav')
+                                    segment_paths.append({
+                                        'path': temp_path,
+                                        'index': i,
+                                        'start': segment['start'],
+                                        'end': segment['end']
+                                    })
+                                    log_area.text(f"Prepared segment {i+1}/{len(segments_info)}")
+                                
+                                # Update progress
+                                progress_bar.progress(0.1)
+                                status_text.text("Initializing models and diarization...")
+                                
+                                # Run optimized transcription with real-time updates
+                                try:
+                                    progress_bar.progress(0.3)
+                                    status_text.text("Starting transcription process...")
+                                    
+                                    # Custom transcription with real-time updates
+                                    log_area.text("Starting transcription process...")
+                                    results = asyncio.run(
+                                        transcribe_with_realtime_updates(
+                                            transcriber, segment_paths, original_audio_path,
+                                            progress_bar, status_text, realtime_areas, log_area
+                                        )
+                                    )
+                                    
+                                    # Update progress
+                                    progress_bar.progress(0.9)
+                                    status_text.text("Combining results...")
+                                    
+                                    # Combine results
+                                    st.write("Combining transcription results...")
+                                    final_transcripts = transcriber.combine_results(results)
+                                    
+                                    # Store results
+                                    st.session_state.transcription_results[file_name] = final_transcripts
+                                    
+                                    # Clean up temporary files
+                                    for segment_path in segment_paths:
+                                        try:
+                                            os.remove(segment_path['path'])
+                                        except Exception as e:
+                                            st.warning(f"Could not remove temporary file {segment_path['path']}: {str(e)}")
+                                    
+                                    # Update progress
+                                    progress_bar.progress(1.0)
+                                    status_text.text("Transcription completed!")
+                                    
+                                    # Display results
+                                    st.write("### 📝 Final Transcription Results")
+                                    for model_name, transcript in final_transcripts.items():
+                                        with st.expander(f"Results from {model_name}"):
+                                            st.text_area("Transcription", transcript, height=300)
+                                    
+                                except Exception as e:
+                                    st.error(f"Error during transcription: {str(e)}")
+                                    st.error("Detailed error information:")
+                                    st.exception(e)
+                                    st.stop()
+                        
+                        except Exception as e:
+                            st.error(f"Error processing file {file_name}: {str(e)}")
+                            st.error("Detailed error information:")
+                            st.exception(e)
+                            st.stop()
+                    
+                    # Mark as completed and rerun
+                    st.session_state.transcription_completed = True
+                    progress_container.empty()
+                    realtime_container.empty()
+                    st.rerun()
 
         # Full Processing Tab
-        with tabs[2]:
+        with tabs[3]:
             if st.button("🎯 Process Selected Audio Files", type="primary"):
                 if not st.session_state.selected_files:
                     st.warning("Please select at least one file to process.")
@@ -480,7 +998,7 @@ def main():
                     
                     try:
                         # Initialize audio analyzer
-                        analyzer = AudioAnalyzer(hf_token)
+                        analyzer = AudioAnalyzer(huggingface_token)
                         
                         # Create a temporary directory for processing
                         with tempfile.TemporaryDirectory() as temp_dir:
@@ -590,7 +1108,17 @@ def main():
             }
             st.session_state.segmentation_completed = False
             st.session_state.total_processing_time = 0
-            st.experimental_rerun()
+            st.session_state.transcription_results = {}
+            st.session_state.transcription_completed = False
+            st.session_state.openai_api_key = ""
+            st.session_state.huggingface_token = ""
+            st.session_state.deepgram_api_key = ""
+            st.session_state.whisper_cloud_enabled = False
+            st.session_state.whisper_local_enabled = False
+            st.session_state.deepgram_enabled = False
+            st.session_state.whisper_cloud_sizes = ["base"]
+            st.session_state.whisper_local_sizes = ["base"]
+            st.rerun()
     else:
         st.info("Please upload audio files in the sidebar to begin.")
 
