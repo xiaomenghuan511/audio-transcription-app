@@ -13,6 +13,7 @@ import pandas as pd
 import io
 import asyncio
 import requests
+import zipfile
 
 # Set page config
 st.set_page_config(
@@ -355,7 +356,7 @@ def main():
         # Whisper Local (with size selection)
         whisper_local_enabled = st.checkbox("Whisper Local")
         if whisper_local_enabled:
-            whisper_local_models = ["tiny", "base", "small", "medium"]
+            whisper_local_models = ["tiny", "base", "small"]
             selected_local_model = st.selectbox(
                 "Select Whisper Local Model Size",
                 whisper_local_models,
@@ -614,100 +615,145 @@ def main():
                             with col3:
                                 st.metric("Original Duration", f"{st.session_state.trimmed_files[file_name]['duration']:.1f}s")
                             
-                            # Display segments table
-                            segments_df = pd.DataFrame([
-                                {
-                                    'Segment': f"Segment {i+1}",
-                                    'Start Time': f"{int(seg['start']//60):02d}:{int(seg['start']%60):02d}",
-                                    'End Time': f"{int(seg['end']//60):02d}:{int(seg['end']%60):02d}",
-                                    'Duration': f"{seg['duration']:.1f}s"
-                                }
-                                for i, seg in enumerate(seg_info['segments'])
-                            ])
-                            st.dataframe(segments_df, use_container_width=True, hide_index=True)
-                            
-                            # Download button for zip file
-                            if os.path.exists(seg_info['zip_path']):
-                                with open(seg_info['zip_path'], 'rb') as f:
-                                    st.download_button(
-                                        label=f"📥 Download Segments for {file_name}",
-                                        data=f,
-                                        file_name=os.path.basename(seg_info['zip_path']),
-                                        mime="application/zip"
-                                    )
+                            # Display segmentation statistics
+                            with st.expander("📊 Segmentation Statistics", expanded=True):
+                                if seg_info['segments']:
+                                    # Calculate statistics
+                                    total_duration = sum(seg['duration'] for seg in seg_info['segments'])
+                                    avg_duration = total_duration / len(seg_info['segments'])
+                                    min_duration = min(seg['duration'] for seg in seg_info['segments'])
+                                    max_duration = max(seg['duration'] for seg in seg_info['segments'])
+                                    
+                                    # Display statistics
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("Total Segments", len(seg_info['segments']))
+                                    with col2:
+                                        st.metric("Average Duration", f"{avg_duration:.1f}s")
+                                    with col3:
+                                        st.metric("Min Duration", f"{min_duration:.1f}s")
+                                    with col4:
+                                        st.metric("Max Duration", f"{max_duration:.1f}s")
+                                    
+                                    # Display segment timeline
+                                    st.write("Segment Timeline:")
+                                    timeline_data = []
+                                    for seg in seg_info['segments']:
+                                        timeline_data.append({
+                                            'Start': seg['start'],
+                                            'End': seg['end'],
+                                            'Duration': seg['duration']
+                                        })
+                                    st.dataframe(timeline_data)
+                                else:
+                                    st.info("Audio file is too short to be segmented. It will be processed as a single segment.")
                 
                 # Process button
-                if st.button("🔄 Segment Selected Files", type="primary"):
+                if st.button("🔄 Process Selected Files", type="primary"):
                     if not files_to_segment:
-                        st.warning("Please select at least one file to segment.")
+                        st.warning("Please select at least one file to process.")
                         st.stop()
                     
-                    # Create progress container
+                    # Create containers for real-time display
                     progress_container = st.empty()
-                    total_start_time = time.time()
+                    realtime_container = st.empty()
                     
-                    for idx, file_name in enumerate(files_to_segment):
-                        file_info = st.session_state.trimmed_files[file_name]
-                        
-                        # Update progress
-                        with progress_container.container():
-                            st.subheader(f"Processing: {file_name} ({idx + 1}/{len(files_to_segment)})")
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            segments_list = st.empty()
-                        
-                        # Initialize segmenter with parameters from sidebar
-                        start_time = time.time()
-                        segmenter = AudioSegmenter(
-                            file_info['path'],
-                            min_segment_length=st.session_state.segmentation_params['min_length'],
-                            max_segment_length=st.session_state.segmentation_params['max_length']
-                        )
-                        
-                        # Update progress - 20%
-                        progress_bar.progress(0.2)
-                        status_text.text("Analyzing audio boundaries...")
-                        
-                        # Segment audio
-                        segments = segmenter.segment_audio()
-                        
-                        # Update progress - 60%
-                        progress_bar.progress(0.6)
-                        status_text.text("Preparing segments...")
-                        
-                        # Create temporary directory for segments
-                        with tempfile.TemporaryDirectory() as temp_dir:
-                            # Export segments
-                            base_filename = os.path.splitext(file_name)[0]
-                            segment_files = segmenter.export_segments(temp_dir, base_filename)
-                            
-                            # Update progress - 80%
-                            progress_bar.progress(0.8)
-                            status_text.text("Creating zip archive...")
-                            
-                            # Create zip file
-                            zip_filename = f"{base_filename}_segments.zip"
-                            zip_path = os.path.join(os.path.dirname(file_info['path']), zip_filename)
-                            segmenter.create_zip_archive(segment_files, zip_path)
-                            
-                            # Store segmentation info
-                            st.session_state.segmented_files[file_name] = {
-                                'segments': segments,
-                                'zip_path': zip_path,
-                                'segment_count': len(segments)
-                            }
-                            
-                            # Update progress - 100%
-                            progress_bar.progress(1.0)
-                            status_text.text("Segmentation complete!")
-                    
-                    # Store total processing time and mark as completed
-                    st.session_state.total_processing_time = time.time() - total_start_time
-                    st.session_state.segmentation_completed = True
-                    
-                    # Clear progress container and rerun to show results
-                    progress_container.empty()
-                    st.rerun()
+                    # Process each file
+                    for file_name in files_to_segment:
+                        st.write(f"Starting processing for {file_name}...")
+                        try:
+                            with progress_container.container():
+                                st.subheader(f"Processing: {file_name}")
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                
+                                # Create a log container that will persist
+                                log_container = st.container()
+                                with log_container:
+                                    st.subheader("📋 Processing Log")
+                                    log_area = st.empty()
+                                    log_area.text("Starting audio processing...")
+                                
+                                # Get audio file path
+                                audio_path = st.session_state.trimmed_files[file_name]['path']
+                                audio_duration = st.session_state.trimmed_files[file_name]['duration']
+                                
+                                # Check if audio is too short for segmentation
+                                if audio_duration < min_segment_length:
+                                    log_area.text("Audio file is too short for segmentation. Processing as a single segment...")
+                                    # Create a single segment for the entire audio
+                                    segment_info = {
+                                        'path': audio_path,
+                                        'start': 0,
+                                        'end': audio_duration,
+                                        'duration': audio_duration,
+                                        'index': 0,
+                                        'audio': AudioSegment.from_file(audio_path)  # Add audio object
+                                    }
+                                    segments = [segment_info]
+                                    
+                                    # Create a zip file with the single segment
+                                    zip_path = os.path.join(tempfile.gettempdir(), f"{os.path.splitext(file_name)[0]}_segments.zip")
+                                    with zipfile.ZipFile(zip_path, 'w') as zipf:
+                                        temp_path = os.path.join(tempfile.gettempdir(), "segment_1.wav")
+                                        segment_info['audio'].export(temp_path, format='wav')
+                                        zipf.write(temp_path, "segment_1.wav")
+                                        os.remove(temp_path)  # Clean up temp file
+                                    
+                                    # Update session state
+                                    st.session_state.segmented_files[file_name] = {
+                                        'segments': segments,
+                                        'zip_path': zip_path
+                                    }
+                                    
+                                    log_area.text("Processing completed successfully!")
+                                    progress_bar.progress(1.0)
+                                    continue
+                                
+                                # Normal segmentation process for longer audio files
+                                log_area.text("Initializing audio segmenter...")
+                                segmenter = AudioSegmenter(
+                                    audio_path=audio_path,
+                                    min_segment_length=min_segment_length,
+                                    max_segment_length=max_segment_length
+                                )
+                                
+                                # Process the file
+                                log_area.text("Starting segmentation...")
+                                segments = segmenter.segment_audio()
+                                
+                                if not segments:
+                                    st.error(f"Failed to segment {file_name}")
+                                    continue
+                                
+                                # Create zip file with segments
+                                log_area.text("Creating zip file with segments...")
+                                zip_path = os.path.join(tempfile.gettempdir(), f"{os.path.splitext(file_name)[0]}_segments.zip")
+                                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                                    for i, segment in enumerate(segments):
+                                        # Handle both segmented and non-segmented audio
+                                        if 'audio' in segment:
+                                            # For normal segmented audio
+                                            temp_path = os.path.join(tempfile.gettempdir(), f"segment_{i+1}.wav")
+                                            segment['audio'].export(temp_path, format='wav')
+                                            zipf.write(temp_path, f"segment_{i+1}.wav")
+                                            os.remove(temp_path)  # Clean up temp file
+                                        else:
+                                            # For short audio that wasn't segmented
+                                            zipf.write(segment['path'], f"segment_{i+1}.wav")
+                                
+                                # Update session state
+                                st.session_state.segmented_files[file_name] = {
+                                    'segments': segments,
+                                    'zip_path': zip_path
+                                }
+                                
+                                log_area.text("Processing completed successfully!")
+                                progress_bar.progress(1.0)
+                                
+                        except Exception as e:
+                            st.error(f"Error processing {file_name}: {str(e)}")
+                            continue
 
         # Transcription & Diarization Tab
         with tabs[2]:
@@ -792,44 +838,58 @@ def main():
                     # Create containers for real-time display
                     progress_container = st.empty()
                     realtime_container = st.empty()
+                    metrics_container = st.empty()
+                    log_container = st.container()
+                    
+                    # Initialize log area
+                    with log_container:
+                        st.subheader("📋 Processing Log")
+                        log_area = st.empty()
                     
                     # Initialize selected models
                     models = []
-                    st.write("Initializing models...")
+                    log_area.text("Initializing models...")
                     if "Whisper Cloud" in selected_models:
-                        st.write("Initializing Whisper Cloud model...")
+                        log_area.text("Initializing Whisper Cloud model...")
                         try:
                             if not openai_api_key:
                                 st.error("OpenAI API key is required for Whisper Cloud")
                                 st.stop()
                             model = WhisperCloudModel("whisper-1", openai_api_key)
-                            st.write("Successfully initialized Whisper Cloud model")
+                            log_area.text("Successfully initialized Whisper Cloud model")
                             models.append(model)
                         except Exception as e:
                             st.error(f"Error initializing Whisper Cloud model: {str(e)}")
                             st.stop()
                     
                     if "Whisper Local" in selected_models:
-                        st.write("Initializing Whisper Local model...")
+                        log_area.text("Initializing Whisper Local model...")
                         try:
                             if not selected_local_model:
                                 st.error("Please select a local model size")
                                 st.stop()
+                            # 创建模型实例但不立即加载
                             model = WhisperLocalModel(selected_local_model)
-                            st.write(f"Successfully initialized Whisper Local {selected_local_model} model")
-                            models.append(model)
+                            # 尝试加载模型
+                            try:
+                                model._load_model()
+                                log_area.text(f"Successfully initialized Whisper Local {selected_local_model} model")
+                                models.append(model)
+                            except Exception as e:
+                                st.error(f"Failed to load Whisper Local model: {str(e)}")
+                                st.stop()
                         except Exception as e:
-                            st.error(f"Error initializing Whisper Local model: {str(e)}")
+                            st.error(f"Error creating Whisper Local model: {str(e)}")
                             st.stop()
                     
                     if "WhisperX" in selected_models:
-                        st.write("Initializing WhisperX model...")
+                        log_area.text("Initializing WhisperX model...")
                         try:
                             if not selected_whisperx_model:
                                 st.error("Please select a WhisperX model size")
                                 st.stop()
                             model = WhisperXModel(selected_whisperx_model)
-                            st.write(f"Successfully initialized WhisperX {selected_whisperx_model} model")
+                            log_area.text(f"Successfully initialized WhisperX {selected_whisperx_model} model")
                             models.append(model)
                         except Exception as e:
                             st.error(f"Error initializing WhisperX model: {str(e)}")
@@ -870,7 +930,7 @@ def main():
                                 with log_container:
                                     st.subheader("📋 Processing Log")
                                     log_area = st.empty()
-                                    log_area.text("Initializing transcription process...")
+                                    log_area.text("Starting transcription process...")
                                 
                                 # Real-time results display
                                 with realtime_container.container():
@@ -954,6 +1014,23 @@ def main():
                                     progress_bar.progress(1.0)
                                     status_text.text("Transcription completed!")
                                     
+                                    # Display metrics at the top
+                                    st.write("### 📊 Transcription Metrics")
+                                    metrics_cols = st.columns(len(models))
+                                    for i, model in enumerate(models):
+                                        metrics = model.metrics
+                                        with metrics_cols[i]:
+                                            st.write(f"**{model.model_name}**")
+                                            st.metric("Transcription Time", f"{metrics['transcription_time']:.2f}s")
+                                            st.metric("Input Tokens", f"{metrics['input_tokens']}")
+                                            st.metric("Output Tokens", f"{metrics['output_tokens']}")
+                                            if metrics['cost'] > 0:
+                                                st.metric("Cost", f"${metrics['cost']:.4f}")
+                                            else:
+                                                st.metric("Cost", "Free (Local Model)")
+                                    
+                                    st.divider()
+                                    
                                     # Display results
                                     st.write("### 📝 Final Transcription Results")
                                     for model_name, transcript in final_transcripts.items():
@@ -976,6 +1053,7 @@ def main():
                     st.session_state.transcription_completed = True
                     progress_container.empty()
                     realtime_container.empty()
+                    metrics_container.empty()
                     st.rerun()
 
         # Full Processing Tab

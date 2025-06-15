@@ -16,6 +16,9 @@ import threading
 import openai
 import logging
 from openai import OpenAI
+import sys
+import urllib.request
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +31,12 @@ class TranscriptionModel:
         self.api_key = api_key
         self._model = None
         self._lock = threading.Lock()
+        self.metrics = {
+            'transcription_time': 0,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'cost': 0
+        }
         
     def _load_model(self):
         """Load model if not already loaded"""
@@ -46,13 +55,33 @@ class WhisperCloudModel(TranscriptionModel):
     async def transcribe(self, audio_path: str) -> str:
         """Transcribe audio using Whisper Cloud API."""
         try:
+            start_time = time.time()
             logger.info(f"Starting transcription of {audio_path} with Whisper Cloud")
+            
+            # 计算输入音频时长（秒）
+            audio = AudioSegment.from_file(audio_path)
+            duration_seconds = len(audio) / 1000.0
+            
             with open(audio_path, "rb") as audio_file:
                 logger.info(f"Calling OpenAI API for transcription...")
                 response = self.client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file
                 )
+                
+                # 计算指标
+                end_time = time.time()
+                self.metrics['transcription_time'] = end_time - start_time
+                
+                # 更准确的输入token计算：每秒约16个token（基于Whisper的采样率）
+                self.metrics['input_tokens'] = int(duration_seconds * 16)
+                
+                # 输出token：使用实际的文本长度
+                self.metrics['output_tokens'] = len(response.text.split())
+                
+                # 成本计算：$0.006 per minute，精确到秒
+                self.metrics['cost'] = (duration_seconds / 60) * 0.006
+                
                 logger.info("Transcription completed successfully")
                 return response.text
         except Exception as e:
@@ -60,21 +89,197 @@ class WhisperCloudModel(TranscriptionModel):
             raise
 
 class WhisperLocalModel(TranscriptionModel):
-    """Local Whisper model"""
+    """Local Whisper model optimized for CPU usage"""
     def __init__(self, model_size: str):
         super().__init__(f"whisper-local-{model_size}")
         self.model_size = model_size
-        
+        self._model = None
+        self._lock = threading.Lock()
+        if sys.platform == 'darwin':  # macOS
+            import multiprocessing
+            multiprocessing.set_start_method('spawn', force=True)
+    
     def _load_model(self):
+        """Load model if not already loaded"""
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    self._model = whisper.load_model(self.model_size)
-        
+                    try:
+                        # 检查本地模型文件
+                        model_path = os.path.expanduser(f"~/.cache/whisper/{self.model_size}.pt")
+                        if not os.path.exists(model_path):
+                            logger.info(f"Model not found locally. Downloading {self.model_size} model...")
+                            try:
+                                # 确保缓存目录存在
+                                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                                
+                                # 使用 HuggingFace URL 下载模型
+                                url = f"https://huggingface.co/openai/whisper-{self.model_size}/resolve/main/pytorch_model.bin"
+                                logger.info(f"Downloading from {url}")
+                                
+                                # 使用 requests 库下载，提供更好的错误处理
+                                import requests
+                                response = requests.get(url, stream=True)
+                                response.raise_for_status()  # 检查响应状态
+                                
+                                # 保存文件
+                                with open(model_path, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                            
+                                logger.info(f"Successfully downloaded model to {model_path}")
+                            except Exception as e:
+                                logger.error(f"Failed to download model: {str(e)}")
+                                raise
+                        
+                        logger.info(f"Using model from {model_path}")
+                        
+                        # 设置环境变量以优化内存使用
+                        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+                        os.environ["OMP_NUM_THREADS"] = "1"
+                        os.environ["MKL_NUM_THREADS"] = "1"
+                        
+                        # 清理内存
+                        import gc
+                        gc.collect()
+                        
+                        try:
+                            # 加载模型 - 简化参数
+                            logger.info("Starting model loading...")
+                            self._model = whisper.load_model(
+                                self.model_size,
+                                device="cpu",
+                                download_root=os.path.expanduser("~/.cache/whisper"),
+                                in_memory=False
+                            )
+                            logger.info("Model loaded successfully")
+                        except Exception as e:
+                            logger.error(f"Error loading model: {str(e)}")
+                            self._model = None
+                            raise
+                        finally:
+                            # 再次清理内存
+                            gc.collect()
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to load Whisper {self.model_size} model: {str(e)}")
+                        self._model = None
+                        raise
+    
     async def transcribe(self, audio_path: str) -> str:
-        self._load_model()
-        result = self._model.transcribe(audio_path)
-        return result["text"]
+        """Transcribe audio file"""
+        try:
+            start_time = time.time()
+            
+            # 验证音频文件
+            if not os.path.exists(audio_path):
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+                
+            # 验证音频格式
+            try:
+                audio = AudioSegment.from_file(audio_path)
+                duration_seconds = len(audio) / 1000.0
+                
+                # 确保音频格式正确
+                if audio.channels > 2:
+                    audio = audio.set_channels(2)
+                if audio.frame_rate != 16000:
+                    audio = audio.set_frame_rate(16000)
+                # 导出为临时文件
+                temp_path = os.path.join(tempfile.gettempdir(), "temp_audio.wav")
+                audio.export(temp_path, format="wav")
+                audio_path = temp_path
+            except Exception as e:
+                raise ValueError(f"Invalid audio format: {str(e)}")
+                
+            # 确保模型已加载
+            self._load_model()
+            if self._model is None:
+                raise RuntimeError("Model failed to load")
+            
+            # 设置转录参数以优化 CPU 性能
+            logger.info(f"Starting transcription with {self.model_size} model...")
+            try:
+                result = self._model.transcribe(
+                    audio_path,
+                    fp16=False,
+                    language=None,
+                    task="transcribe",
+                    beam_size=1,
+                    best_of=1,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6
+                )
+                
+                # 计算指标
+                end_time = time.time()
+                self.metrics['transcription_time'] = end_time - start_time
+                
+                # 更准确的输入token计算：每秒约16个token（基于Whisper的采样率）
+                self.metrics['input_tokens'] = int(duration_seconds * 16)
+                
+                # 输出token：使用实际的文本长度
+                self.metrics['output_tokens'] = len(result["text"].split())
+                
+                # 本地模型无成本
+                self.metrics['cost'] = 0
+                
+                logger.info("Transcription completed successfully")
+                return result["text"]
+            finally:
+                # 清理临时文件
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                
+        except Exception as e:
+            logger.error(f"Transcription failed: {str(e)}")
+            raise
+
+class WhisperXModel(TranscriptionModel):
+    """WhisperX model for transcription with speaker diarization"""
+    def __init__(self, model_size: str):
+        super().__init__(f"whisperx-{model_size}")
+        self.model_size = model_size
+        self._model = None
+        self._lock = threading.Lock()
+    
+    async def transcribe(self, audio_path: str) -> str:
+        """Transcribe audio using WhisperX"""
+        try:
+            start_time = time.time()
+            
+            # 加载音频
+            audio = AudioSegment.from_file(audio_path)
+            duration_seconds = len(audio) / 1000.0
+            
+            # 加载模型
+            if self._model is None:
+                with self._lock:
+                    if self._model is None:
+                        self._model = whisperx.load_model(self.model_size, device="cpu")
+            
+            # 转录
+            result = self._model.transcribe(audio_path)
+            
+            # 计算指标
+            end_time = time.time()
+            self.metrics['transcription_time'] = end_time - start_time
+            
+            # 更准确的输入token计算：每秒约16个token（基于Whisper的采样率）
+            self.metrics['input_tokens'] = int(duration_seconds * 16)
+            
+            # 输出token：使用实际的文本长度
+            self.metrics['output_tokens'] = len(result["text"].split())
+            
+            # 本地模型无成本
+            self.metrics['cost'] = 0
+            
+            return result["text"]
+        except Exception as e:
+            logger.error(f"WhisperX transcription failed: {str(e)}")
+            raise
 
 class DeepgramModel(TranscriptionModel):
     """Deepgram API model"""
